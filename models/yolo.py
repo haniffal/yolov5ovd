@@ -76,9 +76,10 @@ class Detect(nn.Module):
     dynamic = False  # force grid reconstruction
     export = False  # export mode
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True, device=None):
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):
         """Initializes YOLOv5 detection layer with specified classes, anchors, channels, and inplace operations."""
         super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -86,16 +87,13 @@ class Detect(nn.Module):
         self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
         self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
         self.register_buffer("anchors", torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
-        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        if device is not None:
-            self.m.to(device)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1).to(self.device) for x in ch)  # output conv
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
 
     def forward(self, x):
         """Processes input through YOLOv5 layers, altering shape for detection: `x(bs, 3, ny, nx, 85)`."""
         z = []  # inference output
         for i in range(self.nl):
-            print(f"Layer {i} - Input device: {x[i].device}, Weight device: {self.m[i].weight.device}")
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
@@ -241,9 +239,7 @@ class DetectionModel(BaseModel):
         if anchors:
             LOGGER.info(f"Overriding model.yaml anchors with anchors={anchors}")
             self.yaml["anchors"] = round(anchors)  # override yaml value
-        # self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
-        device = next(self.parameters()).device  # ambil device dari parameter model
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch], device=device)
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml["nc"])]  # default names
         self.inplace = self.yaml.get("inplace", True)
 
@@ -257,9 +253,7 @@ class DetectionModel(BaseModel):
 
             s = 256  # 2x min stride
             m.inplace = self.inplace
-            # m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s).to(next(self.parameters()).device))])
-
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
@@ -381,7 +375,7 @@ class ClassificationModel(BaseModel):
         self.model = None
 
 
-def parse_model(d, ch, device=None):
+def parse_model(d, ch):
     """Parses a YOLOv5 model from a dict `d`, configuring layers based on input channels `ch` and model architecture."""
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act, ch_mul = (
@@ -442,11 +436,7 @@ def parse_model(d, ch, device=None):
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
         elif m in {Detect, Segment}:
-            print('f:', f)
-            print('ch:', ch)
             args.append([ch[x] for x in f])
-            if m is Detect:
-                fargs.append(device)
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
             if m is Segment:
