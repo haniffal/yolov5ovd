@@ -1,5 +1,5 @@
 # Dataset root directory relative to the yolov5 directory
-path: ../ovddataset2/datasetfixfix
+path: ../../ovddataset2/datasetfixfix
 
 # Train/val/test sets: specify directories, *.txt files, or lists
 train: images/train # 128 images for training
