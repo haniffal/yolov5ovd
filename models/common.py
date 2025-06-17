@@ -88,10 +88,12 @@ class Conv(nn.Module):
 
     def forward(self, x):
         """Applies a convolution followed by batch normalization and an activation function to the input tensor `x`."""
+        x = x.to(self.device)
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
         """Applies a fused convolution and activation function to the input tensor `x`."""
+        x = x.to(self.device)
         return self.act(self.conv(x))
 
 
@@ -231,6 +233,7 @@ class CrossConv(nn.Module):
         """Performs feature sampling, expanding, and applies shortcut if channels match; expects `x` input tensor."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
+## GOA
 ## GOA
 def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution with padding"""
