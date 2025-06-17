@@ -227,6 +227,186 @@ class CrossConv(nn.Module):
         """Performs feature sampling, expanding, and applies shortcut if channels match; expects `x` input tensor."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
+## GOA
+def conv3x3(in_planes, out_planes, stride=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+    
+class Attention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def forward(self, FWT: GramSchmidtTransform, input: Tensor):
+        #happens once in case of BigFilter
+        while input[0].size(-1) > 1:
+            input = FWT(input.to(self.device))
+        b = input.size(0)
+        return input.view(b, -1)
+
+def gram_schmidt(input):
+    def projection(u, v):
+        return (v * u).sum() / (u * u).sum() * u
+    output = []
+    for x in input:
+        for y in output:
+            x = x - projection(y, x)
+        x = x/x.norm(p=2)
+        output.append(x)
+    return torch.stack(output)
+
+
+def initialize_orthogonal_filters(c, h, w):
+
+    if h*w < c:
+        n = c//(h*w)
+        gram = []
+        for i in range(n):
+            gram.append(gram_schmidt(torch.rand([h * w, 1, h, w])))
+        return torch.cat(gram, dim=0)
+    else:
+        return gram_schmidt(torch.rand([c, 1, h, w]))
+
+class GramSchmidtTransform(torch.nn.Module):
+    instance: Dict[int, Optional[GramSchmidtTransform]] = {}
+    constant_filter: Tensor
+
+    @staticmethod
+    def build(c: int, h: int):
+        if c not in GramSchmidtTransform.instance:
+            GramSchmidtTransform.instance[(c, h)] = GramSchmidtTransform(c, h)
+        return GramSchmidtTransform.instance[(c, h)]
+
+    def __init__(self, c: int, h: int):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        with torch.no_grad():
+            rand_ortho_filters = initialize_orthogonal_filters(c, h, h).view(c, h, h)
+        self.register_buffer("constant_filter", rand_ortho_filters.to(self.device).detach())
+        
+    def forward(self, x):
+        _, _, h, w = x.shape
+        _, H, W = self.constant_filter.shape
+        if h != H or w != W: x = torch.nn.functional.adaptive_avg_pool2d(x, (H, W))
+        return (self.constant_filter * x).sum(dim=(-1, -2), keepdim=True)
+
+class channel_shuffle(nn.Module):
+    def __init__(self, num_groups: int):
+        super(channel_shuffle, self).__init__()
+        self.num_groups = num_groups
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size, num_channels, height, width = x.size()
+        groups = self.num_groups
+        assert num_channels % groups == 0, "Number of channels must be divisible by groups"
+        
+        # Split the channels into groups, shuffle them, and then concatenate them back
+        channels_per_group = num_channels // groups
+        x = x.view(batch_size, groups, channels_per_group, height, width)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()
+        x = x.view(batch_size, num_channels, height, width)
+        
+        return x
+
+class SpatialAttention(nn.Module):
+    def __init__(self, in_channels: int):
+        super(SpatialAttention, self).__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Maxpooling dan Avgpooling untuk mengekstraksi fitur spasial
+        self.maxpool = nn.MaxPool2d(kernel_size=7, stride=1, padding=3)
+        self.avgpool = nn.AvgPool2d(kernel_size=7, stride=1, padding=3)
+        
+        # Menghitung jumlah saluran input yang digabungkan
+        out_channels = in_channels * 2  # karena kita menggabungkan maxpool dan avgpool
+        
+        # Konvolusi 1x1 untuk menghasilkan saluran perhatian spasial
+        self.conv = nn.Conv2d(out_channels, 1, kernel_size=1).to(self.device)
+        self.sigmoid = nn.Sigmoid()
+        
+
+    def forward(self, x):
+        # Menyimpan input fitur asli sebelum melalui konvolusi
+        original_input = x.to(self.device)
+        
+        max_pool_out = self.maxpool(x)
+        avg_pool_out = self.avgpool(x)
+        
+        # Menggabungkan hasil MaxPool dan AvgPool
+        x = torch.cat([max_pool_out, avg_pool_out], dim=1)
+        x = x.to(self.device)
+        
+        # Terapkan konvolusi 1x1
+        x = self.conv(x)
+        
+        # Terapkan sigmoid untuk menghasilkan peta perhatian
+        attention_map = self.sigmoid(x)
+        
+        # Kalikan dengan input untuk menghasilkan output dengan perhatian spasial
+        return original_input * attention_map
+    
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes,height, stride=1, downsample=None, num_groups=4):
+        super(BasicBlock, self).__init__()
+        self._process: nn.Module = nn.Sequential(
+            conv3x3(inplanes // num_groups, planes // num_groups, stride),
+            nn.BatchNorm2d(planes // num_groups),
+            nn.ReLU(inplace=False),
+            conv3x3(planes // num_groups, planes // num_groups),
+            nn.BatchNorm2d(planes // num_groups),
+        )
+        self.downsample = downsample
+        self.stride = stride
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.planes = planes
+        self.num_groups = num_groups  # Number of groups for splitting
+
+        self._excitation = nn.Sequential(
+            nn.Linear(in_features=planes // num_groups, out_features=round(planes / 16), device=self.device, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_features=round(planes / 16), out_features=planes // num_groups, device=self.device, bias=False),
+            nn.Sigmoid(),
+        )
+        self.OrthoAttention = Attention()
+        self.F_C_A = GramSchmidtTransform.build(planes // num_groups, height)
+        self.channel_shuffle = channel_shuffle(self.num_groups)
+        self.spatial_attention = SpatialAttention(planes)
+
+    def forward(self, x):
+        # residual = x if self.downsample is None else self.downsample(x)
+        
+        # Make sure the input channels can be divided by the number of groups
+        if x.size(1) % self.num_groups != 0:
+            self.num_groups = x.size(1)  # Adjust the number of groups if it doesn't divide evenly
+            print(f"Adjusted number of groups to {self.num_groups} for input channels {x.size(1)}")
+
+        # Split the input into groups
+        groups = torch.split(x, x.size(1) // self.num_groups, dim=1)
+        
+        # Process each group through the basic block
+        group_outputs = []
+        for group in groups:
+            # out = self._process(group)
+            out = group
+            compressed = self.OrthoAttention(self.F_C_A, out)
+            b, c = out.size(0), out.size(1)
+            excitation = self._excitation(compressed).view(b, c, 1, 1)
+            attention = excitation * out.to(self.device)
+            group_outputs.append(attention)
+        
+        # Concatenate all group outputs
+        concatenated_output = torch.cat(group_outputs, dim=1)
+        
+        # Shuffle the channels
+        shuffled_output = self.channel_shuffle(concatenated_output)
+        
+        # Terapkan Spatial Attention pada shuffled_output
+        output = self.spatial_attention(shuffled_output)
+        
+        return output
 
 class C3(nn.Module):
     """Implements a CSP Bottleneck module with three convolutions for enhanced feature extraction in neural networks."""
@@ -235,16 +415,63 @@ class C3(nn.Module):
         """Initializes C3 module with options for channel count, bottleneck repetition, shortcut usage, group
         convolutions, and expansion.
         """
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.basicblock = BasicBlock(c_, c_, 640)
 
     def forward(self, x):
         """Performs forward propagation using concatenated outputs from two convolutions and a Bottleneck sequence."""
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        x = x.to(self.device)  # Pindahkan input ke perangkat yang sesuai
+
+        # Hasil dari cv1(x), m(cv1(x)), dan cv2(x) harus berada di perangkat yang sama
+        x1 = self.cv1(x).to(self.device)
+        x2 = self.cv2(x).to(self.device)
+        x3 = self.m(x1).to(self.device)
+
+        # Gabungkan hasilnya dan pastikan semuanya berada di perangkat yang sama
+        out = torch.cat((self.basicblock(x3), x2), 1).to(self.device)  # Pindahkan hasil gabungan ke perangkat yang benar
+
+        # Terapkan konvolusi terakhir dan pastikan berada di perangkat yang benar
+        return self.cv3(out)
+        # out = self.cv1(x)
+        # # print("out cv1:", out.shape)
+        # out2 = self.cv2(x)
+        # # print("out cv2:", out.shape)
+        # out = self.m(out)
+        # # print("out bottleneck:", out.shape)
+        # out = self.basicblock(out)
+        # # print("out goa:", out.shape)
+        # # out = self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        # # print ("out conv1:",self.cv1(x).shape)
+        # # print ("out conv2:",self.cv2(x).shape)
+        # # print ("out bottle:",self.m(self.cv1(x)).shape)
+        # # print ("out c3:",out.shape)
+
+        # return self.cv3(torch.cat((self.basicblock(self.m(self.cv1(x))), self.cv2(x)), 1))#torch.cat((out, out2), dim = 1)
+
+
+# class C3(nn.Module):
+#     """Implements a CSP Bottleneck module with three convolutions for enhanced feature extraction in neural networks."""
+
+#     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+#         """Initializes C3 module with options for channel count, bottleneck repetition, shortcut usage, group
+#         convolutions, and expansion.
+#         """
+#         super().__init__()
+#         c_ = int(c2 * e)  # hidden channels
+#         self.cv1 = Conv(c1, c_, 1, 1)
+#         self.cv2 = Conv(c1, c_, 1, 1)
+#         self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+#         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+#     def forward(self, x):
+#         """Performs forward propagation using concatenated outputs from two convolutions and a Bottleneck sequence."""
+#         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
 class C3x(C3):
