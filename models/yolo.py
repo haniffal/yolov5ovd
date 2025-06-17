@@ -76,7 +76,7 @@ class Detect(nn.Module):
     dynamic = False  # force grid reconstruction
     export = False  # export mode
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True, device=None):
         """Initializes YOLOv5 detection layer with specified classes, anchors, channels, and inplace operations."""
         super().__init__()
         self.nc = nc  # number of classes
@@ -87,6 +87,8 @@ class Detect(nn.Module):
         self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
         self.register_buffer("anchors", torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        if device is not None:
+            self.m.to(device)
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
 
     def forward(self, x):
@@ -239,7 +241,9 @@ class DetectionModel(BaseModel):
         if anchors:
             LOGGER.info(f"Overriding model.yaml anchors with anchors={anchors}")
             self.yaml["anchors"] = round(anchors)  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        # self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        device = next(self.parameters()).device  # ambil device dari parameter model
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch], device=device)
         self.names = [str(i) for i in range(self.yaml["nc"])]  # default names
         self.inplace = self.yaml.get("inplace", True)
 
@@ -377,7 +381,7 @@ class ClassificationModel(BaseModel):
         self.model = None
 
 
-def parse_model(d, ch):
+def parse_model(d, ch, device=None):
     """Parses a YOLOv5 model from a dict `d`, configuring layers based on input channels `ch` and model architecture."""
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act, ch_mul = (
@@ -441,6 +445,8 @@ def parse_model(d, ch):
             print('f:', f)
             print('ch:', ch)
             args.append([ch[x] for x in f])
+            if m is Detect:
+                fargs.append(device)
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
             if m is Segment:
