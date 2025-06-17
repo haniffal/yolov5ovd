@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Common modules."""
 
+from __future__ import annotations
 import ast
 import contextlib
 import json
@@ -12,6 +13,9 @@ from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
 from urllib.parse import urlparse
+from torch import Tensor
+from typing import Optional, Dict
+import torch.nn.functional as F
 
 import cv2
 import numpy as np
